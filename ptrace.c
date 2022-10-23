@@ -34,7 +34,6 @@
 #include <time.h>
 #include <sys/types.h>
 #include <sys/stat.h>
-#include <sys/ptrace.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -46,14 +45,7 @@
 #include <stdbool.h>
 #include <limits.h>
 #include <fcntl.h>
-
-// dirty hack for FreeBSD
-#if defined(__FreeBSD__) || defined(__FreeBSD_kernel__)
-#define PTRACE_ATTACH PT_ATTACH
-#define PTRACE_DETACH PT_DETACH
-#define PTRACE_PEEKDATA PT_READ_D
-#define PTRACE_POKEDATA PT_WRITE_D
-#endif
+#include <sys/uio.h>
 
 #include "common.h"
 #include "value.h"
@@ -93,134 +85,49 @@ static struct {
 #endif
 } peekbuf;
 
-
-bool sm_attach(pid_t target)
-{
-    if (!sm_globals.options.no_ptrace)
-    {
-        int status;
-
-        /* attach to the target application, which should cause a SIGSTOP */
-        if (ptrace(PTRACE_ATTACH, target, NULL, NULL) == -1L) {
-            show_error("failed to attach to %d, %s\n", target, strerror(errno));
-            return false;
-        }
-
-        /* wait for the SIGSTOP to take place. */
-        if (waitpid(target, &status, 0) == -1 || !WIFSTOPPED(status)) {
-            show_error("there was an error waiting for the target to stop.\n");
-            show_info("%s\n", strerror(errno));
-            return false;
-        }
-    }
-
-    /* reset the peek buffer */
-    peekbuf.size = 0;
-    peekbuf.base = NULL;
-
-#if HAVE_PROCMEM
-    { /* open the `/proc/<pid>/mem` file */
-        char mem[32];
-        int fd;
-
-        /* print the path to mem file */
-        snprintf(mem, sizeof(mem), "/proc/%d/mem", target);
-
-        /* attempt to open the file */
-        if ((fd = open(mem, O_RDWR)) == -1) {
-            show_error("unable to open %s.\n", mem);
-            return false;
-        }
-        peekbuf.procmem_fd = fd;
-    }
-#else
-    peekbuf.pid = target;
-#endif
-
-    /* everything looks okay */
-    return true;
-
-}
-
-bool sm_detach(pid_t target)
-{
-#if HAVE_PROCMEM
-    /* close the mem file before detaching */
-    close(peekbuf.procmem_fd);
-#endif
-
-    if (!sm_globals.options.no_ptrace)
-    {
-        /* addr is ignored on Linux, but should be 1 on FreeBSD in order to let
-        * the child process continue execution where it had been interrupted */
-        return ptrace(PTRACE_DETACH, target, 1, 0) == 0;
-    }
-    else
-    {
-        return true;
-    }
-}
-
-
 /* Reads data from the target process, and places it on the `dest_buffer`
- * using either `ptrace` or `pread` on `/proc/pid/mem`.
- * The target process is not passed, but read from the static peekbuf.
- * `sm_attach()` MUST be called before this function. */
-static inline size_t readmemory(uint8_t *dest_buffer, const char *target_address, size_t size)
+ * using `process_vm_readv`. */
+static inline size_t readmemory(pid_t target, uint8_t *dest_buffer, const char *target_address, size_t size)
 {
-    size_t nread = 0;
+    struct iovec local = {
+        .iov_base = (void*)dest_buffer,
+        .iov_len = size,
+    };
 
-#if HAVE_PROCMEM
-    do {
-        ssize_t ret = pread(peekbuf.procmem_fd, dest_buffer + nread,
-                            size - nread, (unsigned long)(target_address + nread));
-        if (ret == -1) {
-            /* we can't read further, report what was read */
-            return nread;
-        }
-        else {
-            /* some data was read */
-            nread += ret;
-        }
-    } while (nread < size);
-#else
-    /* Read the memory with `ptrace()`: the API specifies that `ptrace()` returns a `long`, which
-     * is the size of a word for the current architecture, so this section will deal in `long`s */
-    assert(size % sizeof(long) == 0);
-    errno = 0;
-    for (nread = 0; nread < size; nread += sizeof(long)) {
-        const char *ptrace_address = target_address + nread;
-        long ptraced_long = ptrace(PTRACE_PEEKDATA, peekbuf.pid, ptrace_address, NULL);
+    struct iovec remote = {
+        .iov_base = (void*)target_address,
+        .iov_len = size,
+    };
 
-        /* check if ptrace() succeeded */
-        if (UNLIKELY(ptraced_long == -1L && errno != 0)) {
-            /* it's possible i'm trying to read partially oob */
-            if (errno == EIO || errno == EFAULT) {
-                int j;
-                /* read backwards until we get a good read, then shift out the right value */
-                for (j = 1, errno = 0; j < sizeof(long); j++, errno = 0) {
-                    /* try for a shifted ptrace - 'continue' (i.e. try an increased shift) if it fails */
-                    ptraced_long = ptrace(PTRACE_PEEKDATA, peekbuf.pid, ptrace_address - j, NULL);
-                    if ((ptraced_long == -1L) && (errno == EIO || errno == EFAULT))
-                        continue;
+    return process_vm_readv(
+        target,
+        &local,
+        1,
+        &remote,
+        1,
+        0
+    );
+}
 
-                    /* store it with the appropriate offset */
-                    uint8_t* new_memory_ptr = (uint8_t*)(&ptraced_long) + j;
-                    memcpy(dest_buffer + nread, new_memory_ptr, sizeof(long) - j);
-                    nread += sizeof(long) - j;
+static inline ssize_t writememory(pid_t target, void *addr, const void *data, size_t len)
+{
+    struct iovec local = {
+        .iov_base = (void*)data,
+        .iov_len = len
+    };
+    struct iovec remote = {
+        .iov_base = (void*)addr,
+        .iov_len = len,
+    };
 
-                    /* interrupt the partial gathering process */
-                    break;
-                }
-            }
-            /* interrupt the gathering process */
-            break;
-        }
-        /* otherwise, ptrace() worked - store the data */
-        memcpy(dest_buffer + nread, &ptraced_long, sizeof(long));
-    }
-#endif
-    return nread;
+    return process_vm_writev(
+        target,
+        &local,
+        1,
+        &remote,
+        1,
+        0
+    );
 }
 
 /*
@@ -228,10 +135,9 @@ static inline size_t readmemory(uint8_t *dest_buffer, const char *target_address
  * 
  * This routine calls either `ptrace(PEEKDATA, ...)` or `pread(...)`,
  * and fills the peekbuf cache, to make a local mirror of the process memory we're interested in.
- * `sm_attach()` MUST be called before this function.
  */
 
-extern inline bool sm_peekdata(const void *addr, uint16_t length, const mem64_t **result_ptr, size_t *memlength)
+extern inline bool sm_peekdata(pid_t pid, const void *addr, uint16_t length, const mem64_t **result_ptr, size_t *memlength)
 {
     const char *reqaddr = addr;
     unsigned int i;
@@ -285,7 +191,7 @@ extern inline bool sm_peekdata(const void *addr, uint16_t length, const mem64_t 
     for (i = 0; i < missing_bytes; i += PEEKDATA_CHUNK)
     {
         const char *target_address = peekbuf.base + peekbuf.size;
-        size_t len = readmemory(&peekbuf.cache[peekbuf.size], target_address, PEEKDATA_CHUNK);
+        size_t len = readmemory(pid, &peekbuf.cache[peekbuf.size], target_address, PEEKDATA_CHUNK);
 
         /* check if the read succeeded */
         if (UNLIKELY(len < PEEKDATA_CHUNK)) {
@@ -335,7 +241,7 @@ static inline uint16_t flags_to_memlength(scan_data_type_t scan_data_type, match
 }
 
 /* This is the function that handles when you enter a value (or >, <, =) for the second or later time (i.e. when there's already a list of matches);
- * it reduces the list to those that still match. It returns false on failure to attach, detach, or reallocate memory, otherwise true. */
+ * it reduces the list to those that still match. */
 bool sm_checkmatches(globals_t *vars,
                      scan_match_type_t match_type,
                      const uservalue_t *uservalue)
@@ -379,10 +285,6 @@ bool sm_checkmatches(globals_t *vars,
     vars->scan_progress = 0.0;
     vars->stop_flag = false;
 
-    /* stop and attach to the target */
-    if (sm_attach(vars->target) == false)
-        return false;
-
     INTERRUPTABLESCAN();
 
     while (reading_swath.first_byte_in_child) {
@@ -396,7 +298,7 @@ bool sm_checkmatches(globals_t *vars,
         void *address = reading_swath.first_byte_in_child + reading_iterator;
 
         /* read value from this address */
-        if (UNLIKELY(sm_peekdata(address, old_length, &memory_ptr, &memlength) == false))
+        if (UNLIKELY(sm_peekdata(vars->target, address, old_length, &memory_ptr, &memlength) == false))
         {
             /* If we can't look at the data here, just abort the whole recording, something bad happened */
             required_extra_bytes_to_record = 0;
@@ -482,8 +384,7 @@ bool sm_checkmatches(globals_t *vars,
 
     show_info("we currently have %ld matches.\n", vars->num_matches);
 
-    /* okay, detach */
-    return sm_detach(vars->target);
+    return true;
 }
 
 
@@ -507,16 +408,11 @@ bool sm_searchregions(globals_t *vars, scan_match_type_t match_type, const userv
 
     assert(sm_scan_routine);
 
-    /* stop and attach to the target */
-    if (sm_attach(vars->target) == false)
-        return false;
-
-   
     /* make sure we have some regions to search */
     if (vars->regions->size == 0) {
         show_warn("no regions defined, perhaps you deleted them all?\n");
         show_info("use the \"reset\" command to refresh regions.\n");
-        return sm_detach(vars->target);
+        return false;
     }
 
     INTERRUPTABLESCAN();
@@ -608,7 +504,7 @@ bool sm_searchregions(globals_t *vars, scan_match_type_t match_type, const userv
 
                 /* load the next buffer block */
                 size_t read_size = MIN(memlength, MAX_ALLOC_SIZE);
-                size_t nread = readmemory(data, reg_pos, read_size);
+                size_t nread = readmemory(vars->target, data, reg_pos, read_size);
                 if (nread < read_size) {
                     /* the region ends here, update `memlength` */
                     memlength = nread;
@@ -678,22 +574,16 @@ bool sm_searchregions(globals_t *vars, scan_match_type_t match_type, const userv
 
     show_info("we currently have %ld matches.\n", vars->num_matches);
 
-    /* okay, detach */
-    return sm_detach(vars->target);
+    return true;
 }
 
 /* Needs to support only ANYNUMBER types */
 bool sm_setaddr(pid_t target, void *addr, const value_t *to)
 {
-    unsigned int i;
-    uint8_t memarray[sizeof(uint64_t)] = {0};
+    uint64_t memarray = {0};
     size_t memlength;
 
-    if (sm_attach(target) == false) {
-        return false;
-    }
-
-    memlength = readmemory(memarray, addr, sizeof(uint64_t));
+    memlength = readmemory(target, memarray, addr, sizeof(uint64_t));
     if (memlength == 0) {
         show_error("couldn't access the target address %10p\n", addr);
         return false;
@@ -709,118 +599,15 @@ bool sm_setaddr(pid_t target, void *addr, const value_t *to)
         return false;
     }
 
-    if (sm_globals.options.no_ptrace)
-    {
-#if HAVE_PROCMEM
-        if (pwrite(peekbuf.procmem_fd, memarray, sizeof(uint64_t), (long)addr) == -1)
-        {
-            return false;
-        }
-#else
-        return false;
-#endif
-    }
-    else
-    {
-        /* Assume `sizeof(uint64_t)` is a multiple of `sizeof(long)` */
-        for (i = 0; i < sizeof(uint64_t); i += sizeof(long))
-        {
-            if (ptrace(PTRACE_POKEDATA, target, addr + i, *(long*)(memarray + i)) == -1L) {
-                return false;
-            }
-        }
-    }
-
-    return sm_detach(target);
+    return writememory(target, addr, memarray, sizeof(uint64_t)) == sizeof(uint64_t);
 }
 
 bool sm_read_array(pid_t target, const void *addr, void *buf, size_t len)
 {
-    if (sm_attach(target) == false) {
-        return false;
-    }
-
-    size_t nread = readmemory(buf, addr, len);
-    if (nread < len)
-    {
-        sm_detach(target);
-        return false;
-    }
-
-    return sm_detach(target);
+    return readmemory(target, buf, addr, len) == (ssize_t)len;
 }
 
-/* TODO: may use /proc/<pid>/mem here */
 bool sm_write_array(pid_t target, void *addr, const void *data, size_t len)
 {
-    unsigned int i,j;
-    long peek_value;
-
-    if (sm_attach(target) == false) {
-        return false;
-    }
-
-    if (sm_globals.options.no_ptrace)
-    {
-#if HAVE_PROCMEM
-        if (pwrite(peekbuf.procmem_fd, data, len, (long)addr) == -1)
-        {
-            return false;
-        }
-#else
-        return false;
-#endif
-    }
-    else
-    {
-        for (i = 0; i + sizeof(long) < len; i += sizeof(long))
-        {
-            if (ptrace(PTRACE_POKEDATA, target, addr + i, *(long *)(data + i)) == -1L) {
-                return false;
-            }
-        }
-
-        if (len - i > 0) /* something left (shorter than a long) */
-        {
-            if (len > sizeof(long)) /* rewrite last sizeof(long) bytes of the buffer */
-            {
-                if (ptrace(PTRACE_POKEDATA, target, addr + len - sizeof(long), *(long *)(data + len - sizeof(long))) == -1L) {
-                    return false;
-                }
-            }
-            else /* we have to play with bits... */
-            {
-                /* try all possible shifting read and write */
-                for(j = 0; j <= sizeof(long) - (len - i); ++j)
-                {
-                    errno = 0;
-                    if(((peek_value = ptrace(PTRACE_PEEKDATA, target, addr - j, NULL)) == -1L) && (errno != 0))
-                    {
-                        if (errno == EIO || errno == EFAULT) /* may try next shift */
-                            continue;
-                        else
-                        {
-                            show_error("%s failed.\n", __func__);
-                            return false;
-                        }
-                    }
-                    else /* peek success */
-                    {
-                        /* write back */
-                        memcpy(((int8_t*)&peek_value)+j, data+i, len-i);
-
-                        if (ptrace(PTRACE_POKEDATA, target, addr - j, peek_value) == -1L)
-                        {
-                            show_error("%s failed.\n", __func__);
-                            return false;
-                        }
-
-                        break;
-                    }
-                }
-            }
-        }
-    }
-
-    return sm_detach(target);
+    return writememory(target, addr, data, len) == (ssize_t)len;
 }

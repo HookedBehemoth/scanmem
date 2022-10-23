@@ -187,7 +187,6 @@ bool handler__set(globals_t * vars, char **argv, unsigned argc)
         /* control returns here when interrupted */
 // settings is allocated with alloca, do not free it
 //        free(settings);
-        sm_detach(vars->target);
         ENDINTERRUPTABLE();
         return true;
     }
@@ -1197,7 +1196,6 @@ bool handler__watch(globals_t * vars, char **argv, unsigned argc)
     val = data_to_val(loc.swath, loc.index);
 
     if (INTERRUPTABLE()) {
-        (void) sm_detach(vars->target);
         ENDINTERRUPTABLE();
         return true;
     }
@@ -1213,10 +1211,7 @@ bool handler__watch(globals_t * vars, char **argv, unsigned argc)
         const mem64_t *memory_ptr;
         size_t memlength;
 
-        if (sm_attach(vars->target) == false)
-            return false;
-
-        if (sm_peekdata(address, sizeof(uint64_t), &memory_ptr, &memlength) == false)
+        if (sm_peekdata(vars->target, address, sizeof(uint64_t), &memory_ptr, &memlength) == false)
             return false;
 
         /* check if the new value is different */
@@ -1233,9 +1228,6 @@ bool handler__watch(globals_t * vars, char **argv, unsigned argc)
 
             show_info("%s %10p -> %s\n", timestamp, address, buf);
         }
-
-        /* detach after valuecmp_routine, since it may read more data (e.g. bytearray) */
-        sm_detach(vars->target);
 
         (void) sleep(1);
     }

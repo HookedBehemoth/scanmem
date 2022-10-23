@@ -208,9 +208,6 @@ void sm_cleanup(void)
     /* free matches array */
     if (sm_globals.matches)
         free(sm_globals.matches);
-
-    /* attempt to detach just in case */
-    sm_detach(sm_globals.target);
 }
 
 /* for front-ends */
@@ -221,6 +218,7 @@ void sm_set_backend(void)
 
 void sm_backend_exec_cmd(const char *commandline)
 {
+    fprintf(stderr, "%s\n", commandline);
     sm_execcommand(&sm_globals, commandline);
     fflush(stdout);
     fflush(stderr);
